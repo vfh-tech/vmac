@@ -11,3 +11,6 @@ ENV/
 *.db-shm
 mock_project_a/
 mock_project_b/
+*.md
+!README.md
+.claude/

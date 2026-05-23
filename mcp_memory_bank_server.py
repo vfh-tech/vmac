@@ -416,6 +416,47 @@ def add_repetitive_task(root_path: str, task_name: str, description: str, steps:
         return f"Error saat menyimpan tugas ke database: {str(e)}"
 
 
+@mcp.tool()
+def read_task(root_path: str, task_name: str) -> str:
+    """
+    Membaca detail lengkap satu SOP/tugas repetitif dari database SQLite.
+    Gunakan saat need to follow atau review satu SOP spesifik tanpa membaca seluruh bank.
+    """
+    norm_path = normalize_path(root_path)
+    logger.info(f"Membaca detail task '{task_name}' untuk proyek di {norm_path}")
+
+    try:
+        with get_db_connection(norm_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM projects WHERE root_path = ?", (norm_path,))
+            project = cursor.fetchone()
+
+            if not project:
+                return f"Error: Proyek di '{norm_path}' belum diinisialisasi."
+
+            project_id = project["id"]
+            cursor.execute(
+                "SELECT * FROM tasks WHERE project_id = ? AND task_name = ?",
+                (project_id, task_name)
+            )
+            task = cursor.fetchone()
+
+            if not task:
+                return f"Error: Task '{task_name}' tidak ditemukan di proyek '{norm_path}'."
+
+            return (
+                f"## SOP: {task['task_name']}\n"
+                f"**Deskripsi:** {task['description']}\n"
+                f"**Files to Modify:** {task['files_to_modify'] or '-'}\n"
+                f"**Steps:**\n{task['steps']}\n"
+                f"**Gotchas:** {task['gotchas'] or '-'}\n"
+                f"**Last Performed:** {task['last_performed']}"
+            )
+    except Exception as e:
+        logger.error(f"Error saat membaca task: {str(e)}")
+        return f"Error: {str(e)}"
+
+
 def main():
     logger.info("Memulai MCP Memory Bank SQLite Server via STDIO...")
     mcp.run(transport="stdio")
