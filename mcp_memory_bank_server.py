@@ -167,14 +167,6 @@ def scan_project(root_path: str) -> dict:
     return detected
 
 
-def write_local_file(root_path: str, file_type: str, content: str):
-    """Menulis berkas markdown Memory Bank ke folder lokal .vmac."""
-    folder = os.path.join(normalize_path(root_path), ".vmac", "rules", "memory-bank")
-    os.makedirs(folder, exist_ok=True)
-    file_path = os.path.join(folder, f"{file_type}.md")
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(content)
-
 
 # =====================================================================
 # MCP TOOLS IMPLEMENTATION
@@ -183,7 +175,7 @@ def write_local_file(root_path: str, file_type: str, content: str):
 @mcp.tool()
 def initialize_memory_bank(project_name: str, root_path: str, initial_analysis: Optional[str] = "") -> str:
     """
-    Mendaftarkan proyek baru dan menginisialisasi 5 file core utama Memory Bank ke dalam SQLite lokal proyek serta direktori .vmac.
+    Mendaftarkan proyek baru dan menginisialisasi 5 file core utama Memory Bank ke dalam SQLite lokal proyek.
     Gunakan tool ini ketika user meminta 'initialize memory bank'.
     """
     norm_path = normalize_path(root_path)
@@ -272,14 +264,10 @@ def initialize_memory_bank(project_name: str, root_path: str, initial_analysis: 
                 
             conn.commit()
             
-        # Simpan ke berkas fisik .vmac lokal proyek
-        for file_type, content in default_content.items():
-            write_local_file(norm_path, file_type, content)
-            
         summary = (
             f"[Memory Bank: Active] Inisialisasi Berhasil! Proyek '{project_name}' telah dikunci di SQLite lokal root proyek.\n"
-            f"Database SQLite (`mcp_memory_bank.db`) dan berkas fisik Markdown telah dibuat di folder `.vmac/rules/memory-bank/`.\n"
-            f"Mohon verifikasi berkas `product.md`, `tech.md`, `architecture.md` secara langsung di IDE dan perbarui dokumen ini jika diperlukan."
+            f"Database SQLite (`mcp_memory_bank.db`) telah dibuat dengan 5 core files.\n"
+            f"Gunakan `read_entire_bank` untuk memulihkan konteks di sesi berikutnya."
         )
         return summary
     except Exception as e:
@@ -292,63 +280,34 @@ def initialize_memory_bank(project_name: str, root_path: str, initial_analysis: 
 def read_entire_bank(root_path: str) -> str:
     """
     MANDATORI: Dipanggil di AWAL SETIAP TUGAS oleh LLM untuk memulihkan seluruh konteks memori.
-    Membaca seluruh isi Core Files proyek dari SQLite dan memastikan sinkronisasi dengan berkas di .vmac/rules/memory-bank/.
+    Membaca seluruh isi Core Files proyek dari SQLite.
     """
     norm_path = normalize_path(root_path)
     logger.info(f"Membaca seluruh bank memori untuk path: {norm_path}")
-    
-    vmac_dir = os.path.join(norm_path, ".vmac", "rules", "memory-bank")
-    
-    # 1. Cek keberadaan folder lokal .vmac
-    if not os.path.exists(vmac_dir):
-        return (
-            f"[Memory Bank: Missing]\n"
-            f"Peringatan: Proyek pada path '{norm_path}' belum terdaftar atau direktori '.vmac/rules/memory-bank/' tidak ditemukan.\n"
-            f"Sangat disarankan untuk menjalankan perintah 'initialize memory bank' untuk memulai sinkronisasi."
-        )
-        
+
     try:
-        # Hubungkan ke database lokal proyek
         with get_db_connection(norm_path) as conn:
             cursor = conn.cursor()
-            
-            # Cek data proyek di SQLite
+
             cursor.execute("SELECT id, project_name FROM projects WHERE root_path = ?", (norm_path,))
             project = cursor.fetchone()
-            
-            # Jika proyek belum ada di SQLite tetapi berkas markdown lokal ada, import otomatis ke SQLite
+
             if not project:
-                project_name = os.path.basename(norm_path)
-                cursor.execute("INSERT INTO projects (project_name, root_path) VALUES (?, ?)", (project_name, norm_path))
-                cursor.execute("SELECT id, project_name FROM projects WHERE root_path = ?", (norm_path,))
-                project = cursor.fetchone()
-                
+                return (
+                    f"[Memory Bank: Missing]\n"
+                    f"Proyek pada path '{norm_path}' belum diinisialisasi.\n"
+                    f"Jalankan 'initialize memory bank' terlebih dahulu."
+                )
+
             project_id = project["id"]
             project_name = project["project_name"]
-            
-            # Cek berkas markdown fisik dan impor/sinkronkan ke SQLite
-            core_files = ['brief', 'product', 'context', 'architecture', 'tech']
-            for file_type in core_files:
-                file_path = os.path.join(vmac_dir, f"{file_type}.md")
-                if os.path.exists(file_path):
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        file_content = f.read()
-                    # Simpan/update ke SQLite
-                    cursor.execute("""
-                        INSERT INTO memory_core (project_id, file_type, content, updated_at)
-                        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                        ON CONFLICT(project_id, file_type) DO UPDATE SET content=excluded.content, updated_at=CURRENT_TIMESTAMP
-                    """, (project_id, file_type, file_content))
-            
-            conn.commit()
-            
-            # Ambil data terbaru dari SQLite untuk ditampilkan
+
             cursor.execute("SELECT file_type, content, updated_at FROM memory_core WHERE project_id = ?", (project_id,))
             rows = cursor.fetchall()
-            
+
             cursor.execute("SELECT task_name, description FROM tasks WHERE project_id = ?", (project_id,))
             task_rows = cursor.fetchall()
-            
+
         output = [
             f"[Memory Bank: Active]",
             f"# MEMORY BANK CONTEXT FOR: {project_name.upper()}",
@@ -356,30 +315,22 @@ def read_entire_bank(root_path: str) -> str:
             f"**Waktu Sinkronisasi:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n",
             "---"
         ]
-        
+
         core_data = {row["file_type"]: (row["content"], row["updated_at"]) for row in rows}
         order = ["brief", "product", "context", "architecture", "tech"]
-        
+
         for file_type in order:
             if file_type in core_data:
                 content, updated_at = core_data[file_type]
                 output.append(f"\n## File: {file_type}.md (Last Updated: {updated_at})")
                 output.append(content)
                 output.append("\n---")
-                
+
         if task_rows:
             output.append("\n## Available Repetitive Tasks (SOP) in Database:")
             for t in task_rows:
                 output.append(f"- **{t['task_name']}**: {t['description']}")
-                
-        # Cek jika tasks.md fisik ada, cantumkan kontennya juga
-        tasks_path = os.path.join(vmac_dir, "tasks.md")
-        if os.path.exists(tasks_path):
-            with open(tasks_path, "r", encoding="utf-8") as f:
-                output.append("\n## File: tasks.md (SOP Workflows)")
-                output.append(f.read())
-                output.append("\n---")
-                
+
         return "\n".join(output)
         
     except Exception as e:
@@ -390,7 +341,7 @@ def read_entire_bank(root_path: str) -> str:
 @mcp.tool()
 def update_memory_block(root_path: str, file_type: str, new_content: str) -> str:
     """
-    Memperbarui satu blok file core tertentu (brief, product, context, architecture, tech) secara sinkron di SQLite dan berkas fisik .vmac.
+    Memperbarui satu blok file core tertentu (brief, product, context, architecture, tech) di SQLite.
     Gunakan ini secara otomatis di akhir task (terutama untuk 'context') atau saat ada perubahan pola.
     """
     norm_path = normalize_path(root_path)
@@ -402,8 +353,7 @@ def update_memory_block(root_path: str, file_type: str, new_content: str) -> str
     if file_type == 'brief':
         return (
             "Peringatan Keamanan: Berkas 'brief.md' adalah dokumen fondasi scope proyek yang HANYA boleh diubah secara manual "
-            "oleh developer. Pembaruan otomatis melalui tool ini diblokir untuk menjaga integritas scope proyek. "
-            "Harap edit berkas '.vmac/rules/memory-bank/brief.md' secara langsung di IDE jika diperlukan."
+            "oleh developer. Pembaruan otomatis melalui tool ini diblokir untuk menjaga integritas scope proyek."
         )
         
     logger.info(f"Mengupdate block '{file_type}' untuk proyek di {norm_path}")
@@ -427,10 +377,7 @@ def update_memory_block(root_path: str, file_type: str, new_content: str) -> str
             """, (project_id, file_type, new_content))
             conn.commit()
             
-        # Tulis ke file fisik .vmac
-        write_local_file(norm_path, file_type, new_content)
-        
-        return f"Sukses: Blok memori '{file_type}.md' berhasil diperbarui secara sinkron di SQLite database dan direktori lokal .vmac."
+        return f"Sukses: Blok memori '{file_type}.md' berhasil diperbarui di SQLite database."
     except Exception as e:
         logger.error(f"Gagal mengupdate blok memori: {str(e)}")
         return f"Error saat memperbarui database: {str(e)}"
@@ -439,7 +386,7 @@ def update_memory_block(root_path: str, file_type: str, new_content: str) -> str
 @mcp.tool()
 def add_repetitive_task(root_path: str, task_name: str, description: str, steps: str, files_to_modify: Optional[str] = "", gotchas: Optional[str] = "") -> str:
     """
-    Menambahkan template prosedur kerja repetitif (SOP) ke dalam database dan menyinkronkan ke berkas lokal .vmac/rules/memory-bank/tasks.md.
+    Menambahkan template prosedur kerja repetitif (SOP) ke dalam database.
     Dipanggil saat ada perintah 'add task' atau 'store this as a task'.
     """
     norm_path = normalize_path(root_path)
@@ -457,51 +404,13 @@ def add_repetitive_task(root_path: str, task_name: str, description: str, steps:
                 
             project_id = project["id"]
             
-            # Simpan task ke database
             cursor.execute("""
                 INSERT INTO tasks (project_id, task_name, description, files_to_modify, steps, gotchas, last_performed)
                 VALUES (?, ?, ?, ?, ?, ?, DATE('now'))
             """, (project_id, task_name, description, files_to_modify, steps, gotchas))
             conn.commit()
-            
-            # Ambil semua task untuk proyek ini untuk di-render ke berkas fisik tasks.md
-            cursor.execute("""
-                SELECT task_name, description, files_to_modify, steps, gotchas, last_performed 
-                FROM tasks 
-                WHERE project_id = ? 
-                ORDER BY id DESC
-            """, (project_id,))
-            tasks = cursor.fetchall()
-            
-        # Format berkas tasks.md
-        markdown_content = ["# Repetitive Tasks & Workflows SOP\n"]
-        markdown_content.append("Dokumen ini mendokumentasikan prosedur kerja berulang (SOP) untuk efisiensi sesi pengembangan selanjutnya.\n")
-        markdown_content.append("---")
-        
-        for idx, task in enumerate(tasks, 1):
-            markdown_content.append(f"\n## {idx}. {task['task_name']}")
-            markdown_content.append(f"**Deskripsi:** {task['description']}")
-            markdown_content.append(f"**Terakhir Dijalankan:** {task['last_performed']}")
-            
-            if task['files_to_modify']:
-                markdown_content.append("\n**Berkas yang perlu dimodifikasi:**")
-                for f in task['files_to_modify'].split('\n'):
-                    if f.strip():
-                        markdown_content.append(f"- {f.strip()}")
-            
-            markdown_content.append("\n**Langkah-langkah Prosedur:**")
-            markdown_content.append(task['steps'])
-            
-            if task['gotchas']:
-                markdown_content.append("\n**Catatan Penting / Gotchas:**")
-                markdown_content.append(task['gotchas'])
-                
-            markdown_content.append("\n---")
-            
-        # Tulis berkas tasks.md ke direktori lokal .vmac
-        write_local_file(norm_path, "tasks", "\n".join(markdown_content))
-        
-        return f"Sukses: Tugas repetitif (SOP) '{task_name}' berhasil disimpan ke SQLite dan disinkronkan ke .vmac/rules/memory-bank/tasks.md."
+
+        return f"Sukses: Tugas repetitif (SOP) '{task_name}' berhasil disimpan ke SQLite."
     except Exception as e:
         logger.error(f"Gagal menyimpan tugas repetitif: {str(e)}")
         return f"Error saat menyimpan tugas ke database: {str(e)}"
