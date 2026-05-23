@@ -507,6 +507,10 @@ def add_repetitive_task(root_path: str, task_name: str, description: str, steps:
         return f"Error saat menyimpan tugas ke database: {str(e)}"
 
 
-if __name__ == "__main__":
+def main():
     logger.info("Memulai MCP Memory Bank SQLite Server via STDIO...")
     mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()

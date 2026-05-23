@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "vmac": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/vfh-tech/vmac.git",
+        "vmac"
+      ]
+    }
+  }
+}
