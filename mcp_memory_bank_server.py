@@ -21,6 +21,7 @@ logger = logging.getLogger("mcp-memory-bank")
 
 # Inisialisasi FastMCP Server
 mcp = FastMCP("Memory Bank SQLite")
+_schema_initialized = False
 
 # =====================================================================
 # DATABASE UTILITIES & SCHEMA INITIALIZATION
@@ -45,8 +46,7 @@ def init_db(conn: sqlite3.Connection, db_path: str):
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
-    
-    # 2. Tabel Memory Core (brief, product, context, architecture, tech)
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS memory_core (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,8 +58,7 @@ def init_db(conn: sqlite3.Connection, db_path: str):
             UNIQUE(project_id, file_type)
         );
     """)
-    
-    # 3. Tabel Tasks (Pekerjaan Repetitif / SOP)
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,6 +70,16 @@ def init_db(conn: sqlite3.Connection, db_path: str):
             gotchas TEXT,
             last_performed DATE,
             FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS task_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER NOT NULL,
+            executed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            result_summary TEXT,
+            FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
         );
     """)
     conn.commit()
@@ -86,11 +95,12 @@ def get_db_connection(root_path: str):
         
     conn = sqlite3.connect(db_path, timeout=10.0)
     conn.row_factory = sqlite3.Row
-    # Mengaktifkan Foreign Key support di SQLite
     conn.execute("PRAGMA foreign_keys = ON;")
-    
-    # Inisialisasi skema tabel otomatis
-    init_db(conn, db_path)
+
+    global _schema_initialized
+    if not _schema_initialized:
+        init_db(conn, db_path)
+        _schema_initialized = True
     try:
         yield conn
     finally:
@@ -167,6 +177,26 @@ def scan_project(root_path: str) -> dict:
     return detected
 
 
+
+# =====================================================================
+# SHARED HELPERS
+# =====================================================================
+
+CORE_FILE_TYPES = {'brief', 'product', 'context', 'architecture', 'tech'}
+
+def _get_project_id(conn: sqlite3.Connection, norm_path: str) -> int | None:
+    """Kembalikan project_id atau None jika belum diinisialisasi."""
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM projects WHERE root_path = ?", (norm_path,))
+    project = cursor.fetchone()
+    return project["id"] if project else None
+
+def _get_task_id(conn: sqlite3.Connection, project_id: int, task_name: str) -> int | None:
+    """Kembalikan task_id atau None jika tidak ditemukan."""
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM tasks WHERE project_id = ? AND task_name = ?", (project_id, task_name))
+    task = cursor.fetchone()
+    return task["id"] if task else None
 
 # =====================================================================
 # MCP TOOLS IMPLEMENTATION
@@ -339,48 +369,167 @@ def read_entire_bank(root_path: str) -> str:
 
 
 @mcp.tool()
+def export_memory_to_md(root_path: str, output_dir: Optional[str] = "") -> str:
+    """
+    Mengekspor seluruh isi memory bank ke file .md.
+    Output default ke .vmac/export/ di root proyek.
+    """
+    norm_path = normalize_path(root_path)
+    logger.info(f"Mengekspor memory bank untuk {norm_path}")
+
+    try:
+        with get_db_connection(norm_path) as conn:
+            project_id = _get_project_id(conn, norm_path)
+            if not project_id:
+                return f"Error: Proyek di path '{norm_path}' belum diinisialisasi."
+
+            cursor = conn.cursor()
+            cursor.execute("SELECT project_name FROM projects WHERE id = ?", (project_id,))
+            project_name = cursor.fetchone()["project_name"]
+
+            cursor.execute("SELECT file_type, content FROM memory_core WHERE project_id = ?", (project_id,))
+            core_rows = cursor.fetchall()
+
+            cursor.execute("SELECT task_name, description, steps, files_to_modify, gotchas FROM tasks WHERE project_id = ?", (project_id,))
+            task_rows = cursor.fetchall()
+
+        if not output_dir:
+            output_dir = os.path.join(norm_path, ".vmac", "export")
+        else:
+            output_dir = normalize_path(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
+
+        exported = []
+
+        for row in core_rows:
+            file_path = os.path.join(output_dir, f"{row['file_type']}.md")
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(row["content"])
+            exported.append(file_path)
+
+        if task_rows:
+            tasks_dir = os.path.join(output_dir, "tasks")
+            os.makedirs(tasks_dir, exist_ok=True)
+            for row in task_rows:
+                safe_name = "".join(c if c.isalnum() or c in "-_ " else "_" for c in row["task_name"])
+                file_path = os.path.join(tasks_dir, f"{safe_name}.md")
+                content = (
+                    f"# {row['task_name']}\n\n"
+                    f"**Deskripsi:** {row['description'] or '-'}\n\n"
+                    f"**Files to Modify:** {row['files_to_modify'] or '-'}\n\n"
+                    f"## Steps\n{row['steps']}\n\n"
+                    f"## Gotchas\n{row['gotchas'] or '-'}\n"
+                )
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                exported.append(file_path)
+
+        return (
+            f"Sukses: Memory bank '{project_name}' diekspor ke {output_dir}\n"
+            f"{len(exported)} file dibuat:\n" +
+            "\n".join(f"- {f}" for f in exported)
+        )
+
+    except Exception as e:
+        logger.error(f"Error saat mengekspor memory: {str(e)}")
+        return f"Error saat mengekspor ke file: {str(e)}"
+
+
+@mcp.tool()
 def update_memory_block(root_path: str, file_type: str, new_content: str) -> str:
     """
     Memperbarui satu blok file core tertentu (brief, product, context, architecture, tech) di SQLite.
     Gunakan ini secara otomatis di akhir task (terutama untuk 'context') atau saat ada perubahan pola.
     """
     norm_path = normalize_path(root_path)
-    
-    if file_type not in ['brief', 'product', 'context', 'architecture', 'tech']:
+
+    if file_type not in CORE_FILE_TYPES:
         return f"Error: Tipe file '{file_type}' tidak valid. Harus salah satu dari core files."
-        
-    # Validasi proteksi untuk brief.md
+
     if file_type == 'brief':
         return (
             "Peringatan Keamanan: Berkas 'brief.md' adalah dokumen fondasi scope proyek yang HANYA boleh diubah secara manual "
             "oleh developer. Pembaruan otomatis melalui tool ini diblokir untuk menjaga integritas scope proyek."
         )
-        
+
     logger.info(f"Mengupdate block '{file_type}' untuk proyek di {norm_path}")
-    
+
     try:
-        # Hubungkan ke database lokal proyek
         with get_db_connection(norm_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT id FROM projects WHERE root_path = ?", (norm_path,))
-            project = cursor.fetchone()
-            
-            if not project:
+            project_id = _get_project_id(conn, norm_path)
+            if not project_id:
                 return f"Error: Proyek di path '{norm_path}' belum diinisialisasi. Jalankan inisialisasi terlebih dahulu."
-                
-            project_id = project["id"]
-            
+
+            cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO memory_core (project_id, file_type, content, updated_at)
                 VALUES (?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(project_id, file_type) DO UPDATE SET content=excluded.content, updated_at=CURRENT_TIMESTAMP
             """, (project_id, file_type, new_content))
             conn.commit()
-            
+
         return f"Sukses: Blok memori '{file_type}.md' berhasil diperbarui di SQLite database."
     except Exception as e:
         logger.error(f"Gagal mengupdate blok memori: {str(e)}")
         return f"Error saat memperbarui database: {str(e)}"
+
+
+@mcp.tool()
+def search_memory(root_path: str, keyword: str) -> str:
+    """
+    Mencari kata kunci di seluruh isi memory_core dan tasks dalam database SQLite.
+    Gunakan untuk menemukan konteks relevan tanpa membaca seluruh bank.
+    """
+    norm_path = normalize_path(root_path)
+    logger.info(f"Mencari keyword '{keyword}' di memory bank untuk {norm_path}")
+
+    try:
+        with get_db_connection(norm_path) as conn:
+            project_id = _get_project_id(conn, norm_path)
+            if not project_id:
+                return f"Error: Proyek di path '{norm_path}' belum diinisialisasi."
+
+            cursor = conn.cursor()
+            pattern = f"%{keyword}%"
+            results = []
+
+            cursor.execute(
+                "SELECT file_type, content FROM memory_core WHERE project_id = ? AND content LIKE ? LIMIT 20",
+                (project_id, pattern)
+            )
+            for row in cursor.fetchall():
+                content = row["content"]
+                idx = content.lower().find(keyword.lower())
+                start = max(0, idx - 80)
+                end = min(len(content), idx + len(keyword) + 80)
+                snippet = content[start:end]
+                if start > 0:
+                    snippet = "..." + snippet
+                if end < len(content):
+                    snippet = snippet + "..."
+                results.append(f"**[{row['file_type']}.md]** {snippet}")
+
+            cursor.execute(
+                "SELECT task_name, description FROM tasks WHERE project_id = ? AND ("
+                "task_name LIKE ? OR description LIKE ? OR steps LIKE ? OR gotchas LIKE ?) LIMIT 20",
+                (project_id, pattern, pattern, pattern, pattern)
+            )
+            for row in cursor.fetchall():
+                results.append(f"**[Task: {row['task_name']}]** Deskripsi: {row['description'] or '-'}")
+
+        if not results:
+            return f"Tidak ditemukan hasil untuk keyword '{keyword}' di memory bank."
+
+        output = [
+            f"## Hasil Pencarian: '{keyword}'",
+            f"Ditemukan {len(results)} kecocokan.\n"
+        ]
+        output.extend(results)
+        return "\n".join(output)
+
+    except Exception as e:
+        logger.error(f"Error saat mencari memory: {str(e)}")
+        return f"Error saat mencari database: {str(e)}"
 
 
 @mcp.tool()
@@ -391,19 +540,14 @@ def add_repetitive_task(root_path: str, task_name: str, description: str, steps:
     """
     norm_path = normalize_path(root_path)
     logger.info(f"Menambahkan tugas repetitif baru '{task_name}' untuk proyek di {norm_path}")
-    
+
     try:
-        # Hubungkan ke database lokal proyek
         with get_db_connection(norm_path) as conn:
+            project_id = _get_project_id(conn, norm_path)
+            if not project_id:
+                return f"Error: Proyek di path '{norm_path}' belum diinisialisasi. Jalankan inisialisasi proyek terlebih dahulu."
+
             cursor = conn.cursor()
-            cursor.execute("SELECT id FROM projects WHERE root_path = ?", (norm_path,))
-            project = cursor.fetchone()
-            
-            if not project:
-                return f"Error: Proyek di path '{norm_path}' tidak ditemukan. Jalankan inisialisasi proyek terlebih dahulu."
-                
-            project_id = project["id"]
-            
             cursor.execute("""
                 INSERT INTO tasks (project_id, task_name, description, files_to_modify, steps, gotchas, last_performed)
                 VALUES (?, ?, ?, ?, ?, ?, DATE('now'))
@@ -417,6 +561,72 @@ def add_repetitive_task(root_path: str, task_name: str, description: str, steps:
 
 
 @mcp.tool()
+def update_task(root_path: str, task_name: str, description: str, steps: str, files_to_modify: Optional[str] = "", gotchas: Optional[str] = "", new_task_name: Optional[str] = "") -> str:
+    """
+    Memperbarui SOP/tugas repetitif yang sudah ada di database.
+    Gunakan new_task_name untuk mengganti nama task sekaligus.
+    """
+    norm_path = normalize_path(root_path)
+    logger.info(f"Mengupdate task '{task_name}' untuk proyek di {norm_path}")
+
+    try:
+        with get_db_connection(norm_path) as conn:
+            project_id = _get_project_id(conn, norm_path)
+            if not project_id:
+                return f"Error: Proyek di path '{norm_path}' belum diinisialisasi. Jalankan inisialisasi proyek terlebih dahulu."
+
+            task_id = _get_task_id(conn, project_id, task_name)
+            if not task_id:
+                return f"Error: Task '{task_name}' tidak ditemukan di proyek ini."
+
+            effective_name = new_task_name if new_task_name else task_name
+
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE tasks
+                SET task_name = ?, description = ?, steps = ?, files_to_modify = ?, gotchas = ?
+                WHERE id = ?
+            """, (effective_name, description, steps, files_to_modify, gotchas, task_id))
+            conn.commit()
+
+        return f"Sukses: Task '{effective_name}' berhasil diperbarui di SQLite."
+    except Exception as e:
+        logger.error(f"Gagal mengupdate task: {str(e)}")
+        return f"Error saat mengupdate task: {str(e)}"
+
+
+@mcp.tool()
+def delete_repetitive_task(root_path: str, task_name: str) -> str:
+    """
+    Menghapus SOP/tugas repetitif dari database.
+    """
+    norm_path = normalize_path(root_path)
+    logger.info(f"Menghapus task '{task_name}' dari proyek di {norm_path}")
+
+    try:
+        with get_db_connection(norm_path) as conn:
+            project_id = _get_project_id(conn, norm_path)
+            if not project_id:
+                return f"Error: Proyek di path '{norm_path}' belum diinisialisasi."
+
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM tasks WHERE project_id = ? AND task_name = ?",
+                (project_id, task_name)
+            )
+
+            if cursor.rowcount == 0:
+                return f"Error: Task '{task_name}' tidak ditemukan di proyek ini."
+
+            conn.commit()
+
+        return f"Sukses: Task '{task_name}' berhasil dihapus dari SQLite."
+    except Exception as e:
+        logger.error(f"Gagal menghapus task: {str(e)}")
+        return f"Error saat menghapus task: {str(e)}"
+
+
+@mcp.tool()
 def read_task(root_path: str, task_name: str) -> str:
     """
     Membaca detail lengkap satu SOP/tugas repetitif dari database SQLite.
@@ -427,22 +637,17 @@ def read_task(root_path: str, task_name: str) -> str:
 
     try:
         with get_db_connection(norm_path) as conn:
+            project_id = _get_project_id(conn, norm_path)
+            if not project_id:
+                return f"Error: Proyek di path '{norm_path}' belum diinisialisasi."
+
+            task_id = _get_task_id(conn, project_id, task_name)
+            if not task_id:
+                return f"Error: Task '{task_name}' tidak ditemukan di proyek ini."
+
             cursor = conn.cursor()
-            cursor.execute("SELECT id FROM projects WHERE root_path = ?", (norm_path,))
-            project = cursor.fetchone()
-
-            if not project:
-                return f"Error: Proyek di '{norm_path}' belum diinisialisasi."
-
-            project_id = project["id"]
-            cursor.execute(
-                "SELECT * FROM tasks WHERE project_id = ? AND task_name = ?",
-                (project_id, task_name)
-            )
+            cursor.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
             task = cursor.fetchone()
-
-            if not task:
-                return f"Error: Task '{task_name}' tidak ditemukan di proyek '{norm_path}'."
 
             return (
                 f"## SOP: {task['task_name']}\n"
@@ -454,6 +659,95 @@ def read_task(root_path: str, task_name: str) -> str:
             )
     except Exception as e:
         logger.error(f"Error saat membaca task: {str(e)}")
+        return f"Error: {str(e)}"
+
+
+@mcp.tool()
+def log_task_execution(root_path: str, task_name: str, result_summary: Optional[str] = "") -> str:
+    """
+    Mencatat eksekusi task ke dalam log historis dan memperbarui last_performed.
+    Gunakan setiap kali selesai menjalankan SOP/tugas repetitif.
+    """
+    norm_path = normalize_path(root_path)
+    logger.info(f"Mencatat eksekusi task '{task_name}' untuk proyek di {norm_path}")
+
+    try:
+        with get_db_connection(norm_path) as conn:
+            project_id = _get_project_id(conn, norm_path)
+            if not project_id:
+                return f"Error: Proyek di path '{norm_path}' belum diinisialisasi."
+
+            task_id = _get_task_id(conn, project_id, task_name)
+            if not task_id:
+                return f"Error: Task '{task_name}' tidak ditemukan di proyek ini."
+
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO task_logs (task_id, result_summary) VALUES (?, ?)",
+                (task_id, result_summary)
+            )
+            cursor.execute(
+                "UPDATE tasks SET last_performed = DATE('now') WHERE id = ?",
+                (task_id,)
+            )
+            conn.commit()
+
+        return f"Sukses: Eksekusi task '{task_name}' tercatat di log."
+    except Exception as e:
+        logger.error(f"Gagal mencatat eksekusi task: {str(e)}")
+        return f"Error saat mencatat log: {str(e)}"
+
+
+@mcp.tool()
+def list_task_history(root_path: str, task_name: Optional[str] = "") -> str:
+    """
+    Menampilkan riwayat eksekusi task dari database.
+    Jika task_name dikosongkan, menampilkan semua log untuk proyek.
+    """
+    norm_path = normalize_path(root_path)
+    logger.info(f"Membaca riwayat task untuk proyek di {norm_path}")
+
+    try:
+        with get_db_connection(norm_path) as conn:
+            project_id = _get_project_id(conn, norm_path)
+            if not project_id:
+                return f"Error: Proyek di path '{norm_path}' belum diinisialisasi."
+
+            cursor = conn.cursor()
+            if task_name:
+                cursor.execute("""
+                    SELECT t.task_name, tl.executed_at, tl.result_summary
+                    FROM task_logs tl
+                    JOIN tasks t ON t.id = tl.task_id
+                    WHERE t.project_id = ? AND t.task_name = ?
+                    ORDER BY tl.executed_at DESC
+                    LIMIT 50
+                """, (project_id, task_name))
+            else:
+                cursor.execute("""
+                    SELECT t.task_name, tl.executed_at, tl.result_summary
+                    FROM task_logs tl
+                    JOIN tasks t ON t.id = tl.task_id
+                    WHERE t.project_id = ?
+                    ORDER BY tl.executed_at DESC
+                    LIMIT 50
+                """, (project_id,))
+
+            rows = cursor.fetchall()
+
+        if not rows:
+            scope = f"task '{task_name}'" if task_name else "proyek ini"
+            return f"Belum ada log eksekusi untuk {scope}."
+
+        output = ["## Riwayat Eksekusi Task"]
+        for row in rows:
+            result = row["result_summary"] or "-"
+            output.append(f"- **[{row['executed_at']}]** {row['task_name']}: {result}")
+
+        return "\n".join(output)
+
+    except Exception as e:
+        logger.error(f"Error saat membaca riwayat task: {str(e)}")
         return f"Error: {str(e)}"
 
 
