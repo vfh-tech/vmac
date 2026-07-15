@@ -88,40 +88,65 @@ Jika Anda ingin menggunakannya di aplikasi **Claude Desktop App**, tambahkan kon
 
 ## 📋 Daftar Tool MCP yang Tersedia
 
-### 1. `initialize_memory_bank`
-Inisialisasi sistem Memory Bank di proyek baru. Menjalankan pemindaian proyek dan membuat database SQLite di root proyek.
-- **Argumen:**
-  - `project_name` (string, required): Nama proyek Anda.
-  - `root_path` (string, required): Jalur absolut direktori root proyek.
-  - `initial_analysis` (string, optional): Catatan analisis tambahan dari arsitektur.
+### Core memory
 
-### 2. `read_entire_bank`
-Membaca seluruh isi Memory Bank dari SQLite untuk memulihkan konteks memori AI di awal tugas.
+#### 1. `initialize_memory_bank`
+Inisialisasi / re-init Memory Bank di root proyek. First-run: buat DB + 5 core + mirror `.vmac`. Re-init: **tidak menimpa** core yang sudah diisi user; hanya pastikan skema/DB/mirror ada dan update `project_name`.
 - **Argumen:**
-  - `root_path` (string, required): Jalur absolut direktori root proyek.
+  - `project_name` (string, required)
+  - `root_path` (string, required)
+  - `initial_analysis` (string, optional) — hanya diterapkan ke `architecture` pada **first-run**
 
-### 3. `update_memory_block`
-Memperbarui satu blok memory core tertentu di database SQLite.
-- **Argumen:**
-  - `root_path` (string, required): Jalur absolut direktori root proyek.
-  - `file_type` (string, required): Salah satu dari `product`, `context`, `architecture`, `tech` (*Tipe `brief` diblokir otomatis*).
-  - `new_content` (string, required): Konten Markdown baru.
+#### 2. `read_entire_bank`
+Baca seluruh core dari SQLite + sync mtime `.vmac` (file menang). Auto-heal jika DB kosong tapi `.vmac` ada.
+- **Argumen:** `root_path` (required)
 
-### 4. `add_repetitive_task`
-Menyimpan Standar Operasional Prosedur (SOP) untuk pekerjaan berulang ke tabel `tasks` di database SQLite.
+#### 3. `update_memory_block`
+Update satu blok core (`product` | `context` | `architecture` | `tech`). `brief` diblokir.
 - **Argumen:**
-  - `root_path` (string, required): Jalur absolut direktori root proyek.
-  - `task_name` (string, required): Nama tugas (misal: "Tambah Model AI Baru").
-  - `description` (string, required): Kegunaan prosedur.
-  - `steps` (string, required): Langkah-langkah detail.
-  - `files_to_modify` (string, optional): Daftar berkas yang perlu diubah.
-  - `gotchas` (string, optional): Catatan kritis yang harus diperhatikan.
+  - `root_path` (required)
+  - `file_type` (required)
+  - `new_content` (required) — full replace (default) atau body section jika `mode=patch`
+  - `mode` (optional, default `replace`): `replace` | `patch`
+  - `section` (optional): heading Markdown level-2 (`## Nama`) yang diganti saat `mode=patch`
 
-### 5. `read_task`
-Membaca detail lengkap satu SOP dari tabel `tasks`, termasuk steps, files_to_modify, dan gotchas.
-- **Argumen:**
-  - `root_path` (string, required): Jalur absolut direktori root proyek.
-  - `task_name` (string, required): Nama task yang ingin dibaca detailnya.
+#### 4. `export_memory_to_md`
+Export seluruh memory ke folder Markdown.
+- **Argumen:** `root_path` (required), `output_dir` (optional, default `.vmac/export/`)
+
+#### 5. `search_memory`
+Cari keyword di `memory_core` + `tasks`.
+- **Argumen:** `root_path` (required), `keyword` (required)
+
+### Tasks (SOP)
+
+#### 6. `add_repetitive_task`
+Simpan SOP baru.
+- **Argumen:** `root_path`, `task_name`, `description`, `steps` (required); `files_to_modify`, `gotchas` (optional)
+
+#### 7. `update_task`
+Update / rename SOP.
+- **Argumen:** `root_path`, `task_name`, `description`, `steps` (required); `files_to_modify`, `gotchas`, `new_task_name` (optional)
+
+#### 8. `delete_repetitive_task`
+Hapus SOP.
+- **Argumen:** `root_path`, `task_name`
+
+#### 9. `read_task`
+Detail satu SOP.
+- **Argumen:** `root_path`, `task_name`
+
+#### 10. `log_task_execution`
+Catat eksekusi SOP + update `last_performed`.
+- **Argumen:** `root_path`, `task_name`; `result_summary` (optional)
+
+#### 11. `list_task_history`
+Riwayat log (max 50).
+- **Argumen:** `root_path`; `task_name` (optional)
+
+### Ops
+
+> Tool `memory_bank_health` ditambahkan di rilis P0 (lihat section setelah implementasi).
 
 ---
 
