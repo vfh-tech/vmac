@@ -312,6 +312,13 @@ def _get_project_id(conn: sqlite3.Connection, norm_path: str) -> int | None:
     project = cursor.fetchone()
     return project["id"] if project else None
 
+def _core_row_exists(conn: sqlite3.Connection, project_id: int, file_type: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM memory_core WHERE project_id = ? AND file_type = ? LIMIT 1",
+        (project_id, file_type),
+    ).fetchone()
+    return row is not None
+
 def _get_task_id(conn: sqlite3.Connection, project_id: int, task_name: str) -> int | None:
     """Kembalikan task_id atau None jika tidak ditemukan."""
     cursor = conn.cursor()
@@ -389,33 +396,49 @@ def initialize_memory_bank(project_name: str, root_path: str, initial_analysis: 
     
     if initial_analysis:
         default_content["architecture"] += f"\n\n## Analisis Awal Tambahan:\n{initial_analysis}"
-        
+
+    is_reinit = False
     try:
         # Hubungkan ke database lokal proyek
         with get_db_connection(norm_path) as conn:
             cursor = conn.cursor()
-            
-            # Bersihkan dan daftarkan ulang proyek di DB lokal proyek sendiri
+
+            # Daftarkan / update nama proyek (root_path unik)
             cursor.execute(
                 "INSERT INTO projects (project_name, root_path) VALUES (?, ?) "
                 "ON CONFLICT(root_path) DO UPDATE SET project_name=excluded.project_name",
                 (project_name, norm_path)
             )
-            
+
             cursor.execute("SELECT id FROM projects WHERE root_path = ?", (norm_path,))
             project_id = cursor.fetchone()["id"]
-            
+
+            existing_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM memory_core WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()["c"]
+            is_reinit = existing_count > 0
+
             for file_type, content in default_content.items():
+                if is_reinit and _core_row_exists(conn, project_id, file_type):
+                    continue  # pertahankan content user
                 upsert_memory_core(conn, project_id, file_type, content)
 
             conn.commit()
             export_project_to_vmac(conn, project_id, norm_path)
 
-        summary = (
-            f"[Memory Bank: Active] Inisialisasi Berhasil! Proyek '{project_name}' telah dikunci di SQLite lokal root proyek.\n"
-            f"Database SQLite (`mcp_memory_bank.db`) dan mirror `.vmac/rules/memory-bank/` telah dibuat.\n"
-            f"Gunakan `read_entire_bank` untuk memulihkan konteks di sesi berikutnya."
-        )
+        if is_reinit:
+            summary = (
+                f"[Memory Bank: Active] Re-init Berhasil! Proyek '{project_name}' "
+                f"di '{norm_path}'. Core existing dipertahankan; mirror `.vmac` di-export ulang."
+            )
+        else:
+            summary = (
+                f"[Memory Bank: Active] Inisialisasi Berhasil! Proyek '{project_name}' "
+                f"telah dikunci di SQLite lokal root proyek.\n"
+                f"Database SQLite (`mcp_memory_bank.db`) dan mirror `.vmac/rules/memory-bank/` telah dibuat.\n"
+                f"Gunakan `read_entire_bank` untuk memulihkan konteks di sesi berikutnya."
+            )
         return summary
     except Exception as e:
         error_msg = f"Gagal menginisialisasi memory bank: {str(e)}"
