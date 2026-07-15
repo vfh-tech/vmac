@@ -326,6 +326,42 @@ def _get_task_id(conn: sqlite3.Connection, project_id: int, task_name: str) -> i
     task = cursor.fetchone()
     return task["id"] if task else None
 
+
+def apply_section_patch(content: str, section: str, body: str) -> str:
+    """Ganti body di bawah heading '## {section}'; append jika belum ada."""
+    section = (section or "").strip()
+    body = body if body is not None else ""
+    if not section:
+        raise ValueError("section kosong")
+
+    raw = content.splitlines()
+    target = f"## {section}"
+    start = None
+    for i, line in enumerate(raw):
+        if line.strip() == target:
+            start = i
+            break
+
+    if start is None:
+        base = content.rstrip()
+        sep = "\n\n" if base else ""
+        return f"{base}{sep}## {section}\n\n{body.rstrip()}\n"
+
+    end = len(raw)
+    for j in range(start + 1, len(raw)):
+        s = raw[j].lstrip()
+        if s.startswith("## ") and not s.startswith("###"):
+            end = j
+            break
+
+    new_block = [target, ""] + (body.rstrip().splitlines() or [""])
+    rebuilt = raw[:start] + new_block
+    if end < len(raw):
+        if rebuilt and rebuilt[-1] != "":
+            rebuilt.append("")
+        rebuilt.extend(raw[end:])
+    return "\n".join(rebuilt).rstrip() + "\n"
+
 # =====================================================================
 # MCP TOOLS IMPLEMENTATION
 # =====================================================================
@@ -602,23 +638,38 @@ def export_memory_to_md(root_path: str, output_dir: Optional[str] = "") -> str:
 
 
 @mcp.tool()
-def update_memory_block(root_path: str, file_type: str, new_content: str) -> str:
+def update_memory_block(
+    root_path: str,
+    file_type: str,
+    new_content: str,
+    mode: Optional[str] = "replace",
+    section: Optional[str] = "",
+) -> str:
     """
-    Memperbarui satu blok file core tertentu (brief, product, context, architecture, tech) di SQLite.
-    Gunakan ini secara otomatis di akhir task (terutama untuk 'context') atau saat ada perubahan pola.
+    Memperbarui satu blok file core (product, context, architecture, tech).
+    mode=replace: new_content mengganti seluruh file.
+    mode=patch: ganti body di bawah heading '## {section}' (append section jika belum ada).
+    brief diblokir.
     """
     norm_path = normalize_path(root_path)
+    mode_norm = (mode or "replace").strip().lower()
 
     if file_type not in CORE_FILE_TYPES:
         return f"Error: Tipe file '{file_type}' tidak valid. Harus salah satu dari core files."
 
-    if file_type == 'brief':
+    if file_type == "brief":
         return (
             "Peringatan Keamanan: Berkas 'brief.md' adalah dokumen fondasi scope proyek yang HANYA boleh diubah secara manual "
             "oleh developer. Pembaruan otomatis melalui tool ini diblokir untuk menjaga integritas scope proyek."
         )
 
-    logger.info(f"Mengupdate block '{file_type}' untuk proyek di {norm_path}")
+    if mode_norm not in ("replace", "patch"):
+        return "Error: mode harus 'replace' atau 'patch'."
+
+    if mode_norm == "patch" and not (section or "").strip():
+        return "Error: mode=patch membutuhkan argumen 'section' (judul ## level-2)."
+
+    logger.info(f"Mengupdate block '{file_type}' mode={mode_norm} untuk proyek di {norm_path}")
 
     try:
         with get_db_connection(norm_path) as conn:
@@ -626,11 +677,20 @@ def update_memory_block(root_path: str, file_type: str, new_content: str) -> str
             if not project_id:
                 return f"Error: Proyek di path '{norm_path}' belum diinisialisasi. Jalankan inisialisasi terlebih dahulu."
 
-            upsert_memory_core(conn, project_id, file_type, new_content)
-            conn.commit()
-            write_core_md(norm_path, file_type, new_content)
+            final_content = new_content
+            if mode_norm == "patch":
+                row = conn.execute(
+                    "SELECT content FROM memory_core WHERE project_id = ? AND file_type = ?",
+                    (project_id, file_type),
+                ).fetchone()
+                current = row["content"] if row else ""
+                final_content = apply_section_patch(current, section.strip(), new_content)
 
-        return f"Sukses: Blok memori '{file_type}.md' berhasil diperbarui di SQLite dan `.vmac`."
+            upsert_memory_core(conn, project_id, file_type, final_content)
+            conn.commit()
+            write_core_md(norm_path, file_type, final_content)
+
+        return f"Sukses: Blok memori '{file_type}.md' berhasil diperbarui di SQLite dan `.vmac` (mode={mode_norm})."
     except Exception as e:
         logger.error(f"Gagal mengupdate blok memori: {str(e)}")
         return f"Error saat memperbarui database: {str(e)}"

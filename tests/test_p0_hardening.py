@@ -2,6 +2,7 @@ import os
 import tempfile
 
 from mcp_memory_bank_server import (
+    apply_section_patch,
     initialize_memory_bank,
     read_entire_bank,
     update_memory_block,
@@ -38,3 +39,47 @@ def test_reinit_fills_missing_core_only():
         initialize_memory_bank("Demo", root)
         bank = read_entire_bank(root)
         assert "Tech Stack" in bank or "tech" in bank.lower()
+
+
+def test_apply_section_patch_replaces_body():
+    src = "# T\n\n## Alpha\n\nold-a\n\n## Beta\n\nold-b\n"
+    out = apply_section_patch(src, "Alpha", "new-a")
+    assert "## Alpha" in out
+    assert "new-a" in out
+    assert "old-a" not in out
+    assert "## Beta" in out
+    assert "old-b" in out
+
+
+def test_apply_section_patch_appends_missing():
+    src = "# T\n\n## Alpha\n\na\n"
+    out = apply_section_patch(src, "Gamma", "g-body")
+    assert "## Gamma" in out
+    assert "g-body" in out
+    assert "## Alpha" in out
+
+
+def test_update_memory_block_patch_mode():
+    with tempfile.TemporaryDirectory() as root:
+        initialize_memory_bank("Demo", root)
+        update_memory_block(root, "context", "# Current Context\n\n## Fokus\n\nold\n\n## Next\n\nn1\n")
+        r = update_memory_block(
+            root, "context", "fresh", mode="patch", section="Fokus"
+        )
+        assert "Sukses" in r
+        body = read_core_md(root, "context")
+        assert "fresh" in body
+        assert "old" not in body
+        assert "## Next" in body
+        assert "n1" in body
+
+
+def test_update_patch_rejects_brief_and_bad_args():
+    with tempfile.TemporaryDirectory() as root:
+        initialize_memory_bank("Demo", root)
+        r1 = update_memory_block(root, "brief", "x", mode="patch", section="Scope")
+        assert "brief" in r1.lower() or "Peringatan" in r1
+        r2 = update_memory_block(root, "context", "x", mode="patch", section="")
+        assert "Error" in r2 or "section" in r2.lower()
+        r3 = update_memory_block(root, "context", "x", mode="nope")
+        assert "Error" in r3 or "mode" in r3.lower()
