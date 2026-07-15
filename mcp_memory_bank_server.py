@@ -570,6 +570,120 @@ def read_entire_bank(root_path: str) -> str:
         return f"[Memory Bank: Missing] Error internal saat membaca database: {str(e)}"
 
 
+def collect_health_report(root_path: str) -> dict:
+    """Kumpul status kesehatan bank (read-only). Tidak menulis DB/md."""
+    norm = normalize_path(root_path)
+    db_path = get_db_path(norm)
+    report = {
+        "status": "missing",
+        "root_path": norm,
+        "db_exists": os.path.isfile(db_path),
+        "db_path": db_path,
+        "project_registered": False,
+        "project_name": None,
+        "core_in_db": [],
+        "core_missing_db": list(CORE_TYPES),
+        "core_md_present": [],
+        "core_md_missing": [],
+        "tasks_count": 0,
+        "tasks_md_exists": os.path.isfile(tasks_md_path(norm)),
+        "issues": [],
+    }
+
+    for ft in CORE_TYPES:
+        if os.path.isfile(core_md_path(norm, ft)):
+            report["core_md_present"].append(ft)
+        else:
+            report["core_md_missing"].append(ft)
+
+    if not report["db_exists"]:
+        if not report["core_md_present"]:
+            report["issues"].append("DB dan mirror .vmac tidak ada")
+        else:
+            report["status"] = "degraded"
+            report["issues"].append(
+                "Mirror .vmac ada tapi DB belum ada (jalankan read_entire_bank untuk auto-heal atau initialize)"
+            )
+        return report
+
+    try:
+        with get_db_connection(norm) as conn:
+            project_id = _get_project_id(conn, norm)
+            if not project_id:
+                report["issues"].append("DB ada tapi project belum terdaftar")
+                if report["core_md_present"]:
+                    report["status"] = "degraded"
+                return report
+
+            row = conn.execute(
+                "SELECT project_name FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            report["project_registered"] = True
+            report["project_name"] = row["project_name"] if row else None
+
+            rows = conn.execute(
+                "SELECT file_type FROM memory_core WHERE project_id = ?",
+                (project_id,),
+            ).fetchall()
+            present = [r["file_type"] for r in rows]
+            report["core_in_db"] = present
+            report["core_missing_db"] = [ft for ft in CORE_TYPES if ft not in present]
+
+            tc = conn.execute(
+                "SELECT COUNT(*) AS c FROM tasks WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()["c"]
+            report["tasks_count"] = int(tc)
+    except Exception as e:
+        report["issues"].append(f"Gagal baca DB: {e}")
+        report["status"] = "degraded"
+        return report
+
+    if report["core_missing_db"]:
+        report["issues"].append(
+            "Core hilang di DB: " + ", ".join(report["core_missing_db"])
+        )
+    if report["core_md_missing"]:
+        report["issues"].append(
+            "Core md hilang: " + ", ".join(report["core_md_missing"])
+        )
+    if report["tasks_count"] > 0 and not report["tasks_md_exists"]:
+        report["issues"].append("Ada tasks di DB tapi tasks.md tidak ada")
+
+    if report["issues"]:
+        report["status"] = "degraded"
+    else:
+        report["status"] = "ok"
+    return report
+
+
+@mcp.tool()
+def memory_bank_health(root_path: str) -> str:
+    """
+    Cek kesehatan Memory Bank di root_path: DB, project, kelengkapan 5 core, mirror .vmac, jumlah tasks.
+    Read-only; tidak mengubah data.
+    """
+    rep = collect_health_report(root_path)
+    lines = [
+        f"[Memory Bank Health: {rep['status'].upper()}]",
+        f"**Root:** {rep['root_path']}",
+        f"**DB:** {'ada' if rep['db_exists'] else 'tidak ada'} (`{rep['db_path']}`)",
+        f"**Project:** {rep['project_name'] or '-'} (registered={rep['project_registered']})",
+        f"**Core DB:** {', '.join(rep['core_in_db']) or '-'}",
+        f"**Core DB missing:** {', '.join(rep['core_missing_db']) or '-'}",
+        f"**Core md:** {', '.join(rep['core_md_present']) or '-'}",
+        f"**Core md missing:** {', '.join(rep['core_md_missing']) or '-'}",
+        f"**Tasks:** {rep['tasks_count']} | tasks.md={'ada' if rep['tasks_md_exists'] else 'tidak'}",
+    ]
+    if rep["issues"]:
+        lines.append("**Issues:**")
+        for i in rep["issues"]:
+            lines.append(f"- {i}")
+    else:
+        lines.append("**Issues:** tidak ada")
+    return "\n".join(lines)
+
+
 @mcp.tool()
 def export_memory_to_md(root_path: str, output_dir: Optional[str] = "") -> str:
     """

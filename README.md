@@ -146,7 +146,9 @@ Riwayat log (max 50).
 
 ### Ops
 
-> Tool `memory_bank_health` ditambahkan di rilis P0 (lihat section setelah implementasi).
+#### 12. `memory_bank_health`
+Cek kesehatan bank (read-only): status `ok` | `degraded` | `missing`, kelengkapan core DB/md, jumlah tasks.
+- **Argumen:** `root_path` (required)
 
 ---
 

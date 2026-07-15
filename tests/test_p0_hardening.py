@@ -7,6 +7,8 @@ from mcp_memory_bank_server import (
     read_entire_bank,
     update_memory_block,
     read_core_md,
+    memory_bank_health,
+    collect_health_report,
 )
 
 
@@ -83,3 +85,31 @@ def test_update_patch_rejects_brief_and_bad_args():
         assert "Error" in r2 or "section" in r2.lower()
         r3 = update_memory_block(root, "context", "x", mode="nope")
         assert "Error" in r3 or "mode" in r3.lower()
+
+
+def test_health_ok_after_init():
+    with tempfile.TemporaryDirectory() as root:
+        initialize_memory_bank("Demo", root)
+        rep = collect_health_report(root)
+        assert rep["status"] == "ok"
+        assert rep["project_registered"] is True
+        assert set(rep["core_in_db"]) == set(["brief", "product", "context", "architecture", "tech"])
+        text = memory_bank_health(root)
+        assert "ok" in text.lower() or "sehat" in text.lower() or "OK" in text
+
+
+def test_health_missing_uninitialized():
+    with tempfile.TemporaryDirectory() as root:
+        rep = collect_health_report(root)
+        assert rep["status"] == "missing"
+        text = memory_bank_health(root)
+        assert "missing" in text.lower() or "belum" in text.lower()
+
+
+def test_health_degraded_missing_md():
+    with tempfile.TemporaryDirectory() as root:
+        initialize_memory_bank("Demo", root)
+        os.remove(os.path.join(root, ".vmac", "rules", "memory-bank", "context.md"))
+        rep = collect_health_report(root)
+        assert rep["status"] == "degraded"
+        assert "context" in rep["core_md_missing"]
