@@ -3,8 +3,8 @@ import sys
 import sqlite3
 import logging
 import contextlib
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Optional, Any
 from mcp.server.fastmcp import FastMCP
 
 # =====================================================================
@@ -21,7 +21,6 @@ logger = logging.getLogger("mcp-memory-bank")
 
 # Inisialisasi FastMCP Server
 mcp = FastMCP("Memory Bank SQLite")
-_schema_initialized = False
 
 # =====================================================================
 # DATABASE UTILITIES & SCHEMA INITIALIZATION
@@ -33,6 +32,133 @@ def normalize_path(path: str) -> str:
 def get_db_path(root_path: str) -> str:
     """Mendapatkan path database SQLite di root proyek target."""
     return os.path.join(normalize_path(root_path), "mcp_memory_bank.db")
+
+CORE_TYPES = ("brief", "product", "context", "architecture", "tech")
+CORE_FILE_TYPES = set(CORE_TYPES)
+
+def get_vmac_dir(root_path: str) -> str:
+    return os.path.join(normalize_path(root_path), ".vmac", "rules", "memory-bank")
+
+def ensure_vmac_dir(root_path: str) -> str:
+    d = get_vmac_dir(root_path)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def core_md_path(root_path: str, file_type: str) -> str:
+    return os.path.join(get_vmac_dir(root_path), f"{file_type}.md")
+
+def tasks_md_path(root_path: str) -> str:
+    return os.path.join(get_vmac_dir(root_path), "tasks.md")
+
+def write_core_md(root_path: str, file_type: str, content: str) -> None:
+    ensure_vmac_dir(root_path)
+    with open(core_md_path(root_path, file_type), "w", encoding="utf-8") as f:
+        f.write(content)
+
+def read_core_md(root_path: str, file_type: str) -> Optional[str]:
+    p = core_md_path(root_path, file_type)
+    if not os.path.isfile(p):
+        return None
+    with open(p, encoding="utf-8") as f:
+        return f.read()
+
+def _row_get(row: Any, key: str, default: str = "") -> str:
+    try:
+        val = row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if val is None else str(val)
+
+def compile_tasks_md(task_rows) -> str:
+    if not task_rows:
+        return "# Repetitive Tasks (SOP)\n\n_Belum ada task terdaftar._\n"
+    parts = ["# Repetitive Tasks (SOP)\n"]
+    for t in task_rows:
+        parts.append(f"## {_row_get(t, 'task_name')}\n")
+        parts.append(f"**Description:** {_row_get(t, 'description', '-')}\n")
+        parts.append(f"**Files:** {_row_get(t, 'files_to_modify', '-')}\n")
+        parts.append(f"**Last performed:** {_row_get(t, 'last_performed', '-')}\n")
+        parts.append(f"\n### Steps\n\n{_row_get(t, 'steps', '-')}\n")
+        parts.append(f"\n### Gotchas\n\n{_row_get(t, 'gotchas', '-')}\n")
+        parts.append("\n---\n")
+    return "\n".join(parts)
+
+def write_tasks_md(root_path: str, task_rows) -> None:
+    ensure_vmac_dir(root_path)
+    with open(tasks_md_path(root_path), "w", encoding="utf-8") as f:
+        f.write(compile_tasks_md(task_rows))
+
+def parse_sqlite_ts(ts: str) -> float:
+    if not ts:
+        return 0.0
+    try:
+        return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+    except Exception:
+        return 0.0
+
+def upsert_memory_core(conn: sqlite3.Connection, project_id: int, file_type: str, content: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO memory_core (project_id, file_type, content, updated_at)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(project_id, file_type) DO UPDATE SET
+            content=excluded.content,
+            updated_at=CURRENT_TIMESTAMP
+        """,
+        (project_id, file_type, content),
+    )
+
+def fetch_tasks(conn: sqlite3.Connection, project_id: int):
+    return conn.execute(
+        """
+        SELECT task_name, description, files_to_modify, steps, gotchas, last_performed
+        FROM tasks WHERE project_id = ? ORDER BY id
+        """,
+        (project_id,),
+    ).fetchall()
+
+def export_project_to_vmac(conn: sqlite3.Connection, project_id: int, root_path: str) -> None:
+    ensure_vmac_dir(root_path)
+    rows = conn.execute(
+        "SELECT file_type, content FROM memory_core WHERE project_id = ?",
+        (project_id,),
+    ).fetchall()
+    for r in rows:
+        write_core_md(root_path, r["file_type"], r["content"])
+    write_tasks_md(root_path, fetch_tasks(conn, project_id))
+
+def refresh_tasks_md(conn: sqlite3.Connection, project_id: int, root_path: str) -> None:
+    write_tasks_md(root_path, fetch_tasks(conn, project_id))
+
+def sync_vmac_with_db(conn: sqlite3.Connection, project_id: int, root_path: str) -> list[str]:
+    """File mtime wins over DB updated_at; missing mirrors filled from DB."""
+    actions: list[str] = []
+    rows = conn.execute(
+        "SELECT file_type, content, updated_at FROM memory_core WHERE project_id = ?",
+        (project_id,),
+    ).fetchall()
+    core_data = {r["file_type"]: (r["content"], r["updated_at"]) for r in rows}
+
+    for file_type in CORE_TYPES:
+        path = core_md_path(root_path, file_type)
+        file_content = read_core_md(root_path, file_type)
+        if file_content is not None:
+            file_mtime = os.path.getmtime(path)
+            db_content, db_ts = core_data.get(file_type, (None, None))
+            db_epoch = parse_sqlite_ts(db_ts) if db_ts else 0.0
+            if db_content is None or file_mtime > db_epoch + 1.0:
+                if db_content != file_content:
+                    upsert_memory_core(conn, project_id, file_type, file_content)
+                    actions.append(f"import:{file_type}")
+                    core_data[file_type] = (file_content, None)
+        elif file_type in core_data:
+            write_core_md(root_path, file_type, core_data[file_type][0])
+            actions.append(f"export:{file_type}")
+
+    if not os.path.isfile(tasks_md_path(root_path)):
+        write_tasks_md(root_path, fetch_tasks(conn, project_id))
+        actions.append("export:tasks")
+    return actions
 
 def init_db(conn: sqlite3.Connection, db_path: str):
     """Inisialisasi skema database jika belum terbentuk."""
@@ -96,11 +222,8 @@ def get_db_connection(root_path: str):
     conn = sqlite3.connect(db_path, timeout=10.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
-
-    global _schema_initialized
-    if not _schema_initialized:
-        init_db(conn, db_path)
-        _schema_initialized = True
+    # CREATE IF NOT EXISTS — aman dipanggil per koneksi (multi-root / tests)
+    init_db(conn, db_path)
     try:
         yield conn
     finally:
@@ -181,8 +304,6 @@ def scan_project(root_path: str) -> dict:
 # =====================================================================
 # SHARED HELPERS
 # =====================================================================
-
-CORE_FILE_TYPES = {'brief', 'product', 'context', 'architecture', 'tech'}
 
 def _get_project_id(conn: sqlite3.Connection, norm_path: str) -> int | None:
     """Kembalikan project_id atau None jika belum diinisialisasi."""
@@ -284,19 +405,15 @@ def initialize_memory_bank(project_name: str, root_path: str, initial_analysis: 
             cursor.execute("SELECT id FROM projects WHERE root_path = ?", (norm_path,))
             project_id = cursor.fetchone()["id"]
             
-            # Simpan 5 core files ke SQLite
             for file_type, content in default_content.items():
-                cursor.execute("""
-                    INSERT INTO memory_core (project_id, file_type, content, updated_at)
-                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                    ON CONFLICT(project_id, file_type) DO UPDATE SET content=excluded.content, updated_at=CURRENT_TIMESTAMP
-                """, (project_id, file_type, content))
-                
+                upsert_memory_core(conn, project_id, file_type, content)
+
             conn.commit()
-            
+            export_project_to_vmac(conn, project_id, norm_path)
+
         summary = (
             f"[Memory Bank: Active] Inisialisasi Berhasil! Proyek '{project_name}' telah dikunci di SQLite lokal root proyek.\n"
-            f"Database SQLite (`mcp_memory_bank.db`) telah dibuat dengan 5 core files.\n"
+            f"Database SQLite (`mcp_memory_bank.db`) dan mirror `.vmac/rules/memory-bank/` telah dibuat.\n"
             f"Gunakan `read_entire_bank` untuk memulihkan konteks di sesi berikutnya."
         )
         return summary
@@ -310,7 +427,8 @@ def initialize_memory_bank(project_name: str, root_path: str, initial_analysis: 
 def read_entire_bank(root_path: str) -> str:
     """
     MANDATORI: Dipanggil di AWAL SETIAP TUGAS oleh LLM untuk memulihkan seluruh konteks memori.
-    Membaca seluruh isi Core Files proyek dari SQLite.
+    Membaca Core Files dari SQLite + sinkronisasi .vmac (mtime file menang).
+    Auto-heal: import dari .vmac jika project belum ada di DB.
     """
     norm_path = normalize_path(root_path)
     logger.info(f"Membaca seluruh bank memori untuk path: {norm_path}")
@@ -323,19 +441,45 @@ def read_entire_bank(root_path: str) -> str:
             project = cursor.fetchone()
 
             if not project:
-                return (
-                    f"[Memory Bank: Missing]\n"
-                    f"Proyek pada path '{norm_path}' belum diinisialisasi.\n"
-                    f"Jalankan 'initialize memory bank' terlebih dahulu."
+                has_vmac = any(read_core_md(norm_path, t) is not None for t in CORE_TYPES)
+                if not has_vmac:
+                    return (
+                        f"[Memory Bank: Missing]\n"
+                        f"Proyek pada path '{norm_path}' belum diinisialisasi.\n"
+                        f"Jalankan 'initialize memory bank' terlebih dahulu."
+                    )
+
+                project_name = os.path.basename(norm_path) or "Recovered Project"
+                cursor.execute(
+                    "INSERT INTO projects (project_name, root_path) VALUES (?, ?)",
+                    (project_name, norm_path),
                 )
+                project_id = cursor.execute(
+                    "SELECT id FROM projects WHERE root_path = ?", (norm_path,)
+                ).fetchone()["id"]
+                for file_type in CORE_TYPES:
+                    content = read_core_md(norm_path, file_type)
+                    if content is not None:
+                        upsert_memory_core(conn, project_id, file_type, content)
+                conn.commit()
+                export_project_to_vmac(conn, project_id, norm_path)
+                logger.info(f"Auto-heal: project '{project_name}' diimpor dari .vmac")
+            else:
+                project_id = project["id"]
+                project_name = project["project_name"]
+                sync_vmac_with_db(conn, project_id, norm_path)
+                conn.commit()
 
-            project_id = project["id"]
-            project_name = project["project_name"]
-
-            cursor.execute("SELECT file_type, content, updated_at FROM memory_core WHERE project_id = ?", (project_id,))
+            cursor.execute(
+                "SELECT file_type, content, updated_at FROM memory_core WHERE project_id = ?",
+                (project_id,),
+            )
             rows = cursor.fetchall()
 
-            cursor.execute("SELECT task_name, description FROM tasks WHERE project_id = ?", (project_id,))
+            cursor.execute(
+                "SELECT task_name, description FROM tasks WHERE project_id = ?",
+                (project_id,),
+            )
             task_rows = cursor.fetchall()
 
         output = [
@@ -343,13 +487,12 @@ def read_entire_bank(root_path: str) -> str:
             f"# MEMORY BANK CONTEXT FOR: {project_name.upper()}",
             f"**Path Proyek:** {norm_path}",
             f"**Waktu Sinkronisasi:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n",
-            "---"
+            "---",
         ]
 
         core_data = {row["file_type"]: (row["content"], row["updated_at"]) for row in rows}
-        order = ["brief", "product", "context", "architecture", "tech"]
 
-        for file_type in order:
+        for file_type in CORE_TYPES:
             if file_type in core_data:
                 content, updated_at = core_data[file_type]
                 output.append(f"\n## File: {file_type}.md (Last Updated: {updated_at})")
@@ -362,7 +505,7 @@ def read_entire_bank(root_path: str) -> str:
                 output.append(f"- **{t['task_name']}**: {t['description']}")
 
         return "\n".join(output)
-        
+
     except Exception as e:
         logger.error(f"Error saat membaca bank memori: {str(e)}")
         return f"[Memory Bank: Missing] Error internal saat membaca database: {str(e)}"
@@ -460,15 +603,11 @@ def update_memory_block(root_path: str, file_type: str, new_content: str) -> str
             if not project_id:
                 return f"Error: Proyek di path '{norm_path}' belum diinisialisasi. Jalankan inisialisasi terlebih dahulu."
 
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO memory_core (project_id, file_type, content, updated_at)
-                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(project_id, file_type) DO UPDATE SET content=excluded.content, updated_at=CURRENT_TIMESTAMP
-            """, (project_id, file_type, new_content))
+            upsert_memory_core(conn, project_id, file_type, new_content)
             conn.commit()
+            write_core_md(norm_path, file_type, new_content)
 
-        return f"Sukses: Blok memori '{file_type}.md' berhasil diperbarui di SQLite database."
+        return f"Sukses: Blok memori '{file_type}.md' berhasil diperbarui di SQLite dan `.vmac`."
     except Exception as e:
         logger.error(f"Gagal mengupdate blok memori: {str(e)}")
         return f"Error saat memperbarui database: {str(e)}"
@@ -553,8 +692,9 @@ def add_repetitive_task(root_path: str, task_name: str, description: str, steps:
                 VALUES (?, ?, ?, ?, ?, ?, DATE('now'))
             """, (project_id, task_name, description, files_to_modify, steps, gotchas))
             conn.commit()
+            refresh_tasks_md(conn, project_id, norm_path)
 
-        return f"Sukses: Tugas repetitif (SOP) '{task_name}' berhasil disimpan ke SQLite."
+        return f"Sukses: Tugas repetitif (SOP) '{task_name}' berhasil disimpan ke SQLite dan `tasks.md`."
     except Exception as e:
         logger.error(f"Gagal menyimpan tugas repetitif: {str(e)}")
         return f"Error saat menyimpan tugas ke database: {str(e)}"
@@ -588,8 +728,9 @@ def update_task(root_path: str, task_name: str, description: str, steps: str, fi
                 WHERE id = ?
             """, (effective_name, description, steps, files_to_modify, gotchas, task_id))
             conn.commit()
+            refresh_tasks_md(conn, project_id, norm_path)
 
-        return f"Sukses: Task '{effective_name}' berhasil diperbarui di SQLite."
+        return f"Sukses: Task '{effective_name}' berhasil diperbarui di SQLite dan `tasks.md`."
     except Exception as e:
         logger.error(f"Gagal mengupdate task: {str(e)}")
         return f"Error saat mengupdate task: {str(e)}"
@@ -619,8 +760,9 @@ def delete_repetitive_task(root_path: str, task_name: str) -> str:
                 return f"Error: Task '{task_name}' tidak ditemukan di proyek ini."
 
             conn.commit()
+            refresh_tasks_md(conn, project_id, norm_path)
 
-        return f"Sukses: Task '{task_name}' berhasil dihapus dari SQLite."
+        return f"Sukses: Task '{task_name}' berhasil dihapus dari SQLite dan `tasks.md`."
     except Exception as e:
         logger.error(f"Gagal menghapus task: {str(e)}")
         return f"Error saat menghapus task: {str(e)}"

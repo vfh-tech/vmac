@@ -1,7 +1,7 @@
 [project]
 name = "vmac"
-version = "1.0.3"
-description = "MCP Memory Bank Server dengan SQLite terisolasi"
+version = "1.4.0"
+description = "MCP Memory Bank Server dengan SQLite terisolasi dan sinkronisasi berkas lokal .vmac"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -10,6 +10,9 @@ dependencies = [
 
 [project.scripts]
 vmac = "mcp_memory_bank_server:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
 
 [build-system]
 requires = ["hatchling"]

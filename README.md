@@ -9,13 +9,15 @@ Sistem ini membantu AI mempertahankan memori jangka panjang, konteks pengerjaan 
 ## 🚀 Fitur Utama
 
 1. **Database Terisolasi per Proyek (Isolasi Dinamis):**
-   Database SQLite (`mcp_memory_bank.db`) dibuat secara dinamis tepat di root proyek target yang Anda tunjuk. Tidak ada database global tunggal; semua memori proyek tersimpan murni di SQLite, terisolasi penuh dan portabel.
-2. **Pemindaian Proyek Cerdas (Smart Auto-Scanning):**
-   Saat inisialisasi awal dijalankan, server akan memindai struktur proyek secara cerdas guna mendeteksi bahasa pemrograman, ekosistem/framework, konfigurasi utama, dan struktur direktori proyek nyata untuk menyusun dokumen `tech.md` dan `architecture.md` awal secara akurat.
-3. **Proteksi Berkas `brief.md`:**
-   Server secara terprogram menolak pembaruan otomatis untuk berkas `brief.md` guna mencegah AI merusak batasan ruang lingkup (*scope*) awal proyek yang seharusnya hanya didefinisikan secara manual oleh developer.
-4. **Kompilasi SOP Otomatis:**
-   Mendokumentasikan instruksi kerja repetitif secara otomatis ke dalam tabel `tasks` terstruktur langsung dari basis data SQLite.
+   Database SQLite (`mcp_memory_bank.db`) dibuat secara dinamis tepat di root proyek target. Tidak ada database global tunggal; memori proyek terisolasi penuh dan portabel.
+2. **Sinkronisasi Berkas Fisik `.vmac`:**
+   Perubahan SQLite di-write-through ke Markdown di `[root_path]/.vmac/rules/memory-bank/` (`brief.md`, `product.md`, `context.md`, `architecture.md`, `tech.md`, `tasks.md`). Core files sinkron dua arah: jika `.md` lebih baru (mtime) dari `updated_at` DB, `read_entire_bank` mengimpor file ke SQLite. `tasks.md` hanya DB→file (kompilasi).
+3. **Pemindaian Proyek Cerdas (Smart Auto-Scanning):**
+   Saat inisialisasi, server memindai struktur proyek untuk menyusun `tech` dan `architecture` awal.
+4. **Proteksi Berkas `brief.md`:**
+   Tool menolak update otomatis `brief`; edit manual via file + import on read.
+5. **Kompilasi SOP Otomatis (`tasks.md`):**
+   SOP di tabel `tasks` dikompilasi ke `.vmac/rules/memory-bank/tasks.md`.
 
 ---
 
