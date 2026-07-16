@@ -21,6 +21,32 @@ Sistem ini membantu AI mempertahankan memori jangka panjang, konteks pengerjaan 
 
 ---
 
+## Edit manual `.vmac` → SQLite
+
+Lokasi mirror: `[root_path]/.vmac/rules/memory-bank/`
+
+| File | Arah sync | Edit manual? |
+|---|---|---|
+| `brief.md`, `product.md`, `context.md`, `architecture.md`, `tech.md` | Dua arah (mtime file menang) | Ya → masuk DB saat `read_entire_bank` |
+| `tasks.md` | Satu arah DB→file | Tidak. Pakai tool task (`add_repetitive_task` / `update_task`) |
+
+### Aturan mtime
+- Pemicu: **hanya** saat `read_entire_bank` (bukan file watcher real-time).
+- Import jika: file ada **dan** `mtime_file > updated_at_DB + 1s` **dan** isi berbeda → upsert ke `memory_core`.
+- Export jika: file hilang, baris DB ada → tulis ulang `.md` dari DB.
+- Auto-heal: project hilang di DB tapi folder `.vmac` ada → import core dari file.
+
+### Langkah edit core
+1. Ubah salah satu core `.md` di atas (contoh `context.md`).
+2. Panggil `read_entire_bank(root_path)`.
+3. Isi file yang lebih baru diimpor ke SQLite; output tool memuat teks hasil edit.
+
+### Yang tidak di-sync balik
+- Edit manual `tasks.md` **tidak** masuk tabel `tasks`.
+- Tidak ada debounce/polling background; tanpa `read_entire_bank`, DB tetap isi lama.
+
+---
+
 ## 🛠️ Persyaratan Sistem
 
 - **Python:** versi `>= 3.10`
@@ -98,8 +124,9 @@ Inisialisasi / re-init Memory Bank di root proyek. First-run: buat DB + 5 core +
   - `initial_analysis` (string, optional) — hanya diterapkan ke `architecture` pada **first-run**
 
 #### 2. `read_entire_bank`
-Baca seluruh core dari SQLite + sync mtime `.vmac` (file menang). Auto-heal jika DB kosong tapi `.vmac` ada.
+Baca seluruh core dari SQLite + **sync mtime `.vmac` (file menang)**. Setelah edit manual core `.md`, panggil tool ini agar isi masuk SQLite. Auto-heal jika DB kosong / project hilang tapi `.vmac` ada.
 - **Argumen:** `root_path` (required)
+- **Efek samping sync:** `import:<file_type>` jika mtime file menang; `export:<file_type>` jika mirror hilang
 
 #### 3. `update_memory_block`
 Update satu blok core (`product` | `context` | `architecture` | `tech`). `brief` diblokir.
@@ -169,6 +196,7 @@ graph TD
     I --> H
 ```
 
-1. **Awal Tugas:** AI wajib menjalankan `read_entire_bank` untuk menyerap status pengerjaan terakhir secara akurat.
-2. **Saat Menghadapi Fitur Berulang:** AI mendeteksi apakah SOP tugas tersebut sudah terdaftar di tabel tasks SQLite dan mengikutinya agar terhindar dari kesalahan yang pernah terjadi sebelumnya.
-3. **Akhir Tugas:** AI memperbarui blok context di SQLite menggunakan `update_memory_block` untuk mendokumentasikan langkah yang telah selesai dan rencana tugas berikutnya lintas sesi.
+1. **Awal Tugas:** AI wajib menjalankan `read_entire_bank` untuk menyerap status terakhir **dan** mengimpor edit manual core `.md` (mtime file menang).
+2. **Saat Menghadapi Fitur Berulang:** AI mendeteksi apakah SOP sudah ada di tabel `tasks` (bukan dari edit `tasks.md`) lalu mengikutinya.
+3. **Akhir Tugas:** AI memperbarui `context` via `update_memory_block` (write-through ke `.md`). Alternatif: edit manual core `.md` lalu `read_entire_bank` di sesi berikutnya.
+4. **Edit manual core:** boleh; selalu diikuti `read_entire_bank`. **Edit manual `tasks.md`:** diabaikan untuk DB — gunakan tool task.
