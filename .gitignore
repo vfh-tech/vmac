@@ -1,19 +1,79 @@
+# Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.dmypy.json
+.pytype/
+.pyre/
+.cache/
+*.log
+
+# Virtual env
 .venv/
 venv/
 ENV/
+env/
+
+# SQLite / local DB runtime
 *.db
 *.db-journal
 *.db-wal
 *.db-shm
+*.sqlite
+*.sqlite3
+
+# Local project fixtures
 mock_project_a/
 mock_project_b/
+
+# Markdown mirrors / notes (keep README only)
 *.md
 !README.md
+
+# Local plans / agent docs (bukan rilis paket)
+docs/
+
+# Tooling / agent local state
 .claude/
-.pytest_cache/
-.vmac/
 .opencode/
+.superpowers/
+.cursor/
+.codex/
+.gemini/
+.vmac/
+.mcp.local.json
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.bak
+*.tmp
+*.orig
+.DS_Store
+Thumbs.db
+
+# Env secrets
+.env
+.env.*
+!.env.example

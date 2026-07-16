@@ -312,12 +312,55 @@ def _get_project_id(conn: sqlite3.Connection, norm_path: str) -> int | None:
     project = cursor.fetchone()
     return project["id"] if project else None
 
+def _core_row_exists(conn: sqlite3.Connection, project_id: int, file_type: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM memory_core WHERE project_id = ? AND file_type = ? LIMIT 1",
+        (project_id, file_type),
+    ).fetchone()
+    return row is not None
+
 def _get_task_id(conn: sqlite3.Connection, project_id: int, task_name: str) -> int | None:
     """Kembalikan task_id atau None jika tidak ditemukan."""
     cursor = conn.cursor()
     cursor.execute("SELECT id FROM tasks WHERE project_id = ? AND task_name = ?", (project_id, task_name))
     task = cursor.fetchone()
     return task["id"] if task else None
+
+
+def apply_section_patch(content: str, section: str, body: str) -> str:
+    """Ganti body di bawah heading '## {section}'; append jika belum ada."""
+    section = (section or "").strip()
+    body = body if body is not None else ""
+    if not section:
+        raise ValueError("section kosong")
+
+    raw = content.splitlines()
+    target = f"## {section}"
+    start = None
+    for i, line in enumerate(raw):
+        if line.strip() == target:
+            start = i
+            break
+
+    if start is None:
+        base = content.rstrip()
+        sep = "\n\n" if base else ""
+        return f"{base}{sep}## {section}\n\n{body.rstrip()}\n"
+
+    end = len(raw)
+    for j in range(start + 1, len(raw)):
+        s = raw[j].lstrip()
+        if s.startswith("## ") and not s.startswith("###"):
+            end = j
+            break
+
+    new_block = [target, ""] + (body.rstrip().splitlines() or [""])
+    rebuilt = raw[:start] + new_block
+    if end < len(raw):
+        if rebuilt and rebuilt[-1] != "":
+            rebuilt.append("")
+        rebuilt.extend(raw[end:])
+    return "\n".join(rebuilt).rstrip() + "\n"
 
 # =====================================================================
 # MCP TOOLS IMPLEMENTATION
@@ -389,33 +432,49 @@ def initialize_memory_bank(project_name: str, root_path: str, initial_analysis: 
     
     if initial_analysis:
         default_content["architecture"] += f"\n\n## Analisis Awal Tambahan:\n{initial_analysis}"
-        
+
+    is_reinit = False
     try:
         # Hubungkan ke database lokal proyek
         with get_db_connection(norm_path) as conn:
             cursor = conn.cursor()
-            
-            # Bersihkan dan daftarkan ulang proyek di DB lokal proyek sendiri
+
+            # Daftarkan / update nama proyek (root_path unik)
             cursor.execute(
                 "INSERT INTO projects (project_name, root_path) VALUES (?, ?) "
                 "ON CONFLICT(root_path) DO UPDATE SET project_name=excluded.project_name",
                 (project_name, norm_path)
             )
-            
+
             cursor.execute("SELECT id FROM projects WHERE root_path = ?", (norm_path,))
             project_id = cursor.fetchone()["id"]
-            
+
+            existing_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM memory_core WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()["c"]
+            is_reinit = existing_count > 0
+
             for file_type, content in default_content.items():
+                if is_reinit and _core_row_exists(conn, project_id, file_type):
+                    continue  # pertahankan content user
                 upsert_memory_core(conn, project_id, file_type, content)
 
             conn.commit()
             export_project_to_vmac(conn, project_id, norm_path)
 
-        summary = (
-            f"[Memory Bank: Active] Inisialisasi Berhasil! Proyek '{project_name}' telah dikunci di SQLite lokal root proyek.\n"
-            f"Database SQLite (`mcp_memory_bank.db`) dan mirror `.vmac/rules/memory-bank/` telah dibuat.\n"
-            f"Gunakan `read_entire_bank` untuk memulihkan konteks di sesi berikutnya."
-        )
+        if is_reinit:
+            summary = (
+                f"[Memory Bank: Active] Re-init Berhasil! Proyek '{project_name}' "
+                f"di '{norm_path}'. Core existing dipertahankan; mirror `.vmac` di-export ulang."
+            )
+        else:
+            summary = (
+                f"[Memory Bank: Active] Inisialisasi Berhasil! Proyek '{project_name}' "
+                f"telah dikunci di SQLite lokal root proyek.\n"
+                f"Database SQLite (`mcp_memory_bank.db`) dan mirror `.vmac/rules/memory-bank/` telah dibuat.\n"
+                f"Gunakan `read_entire_bank` untuk memulihkan konteks di sesi berikutnya."
+            )
         return summary
     except Exception as e:
         error_msg = f"Gagal menginisialisasi memory bank: {str(e)}"
@@ -511,6 +570,120 @@ def read_entire_bank(root_path: str) -> str:
         return f"[Memory Bank: Missing] Error internal saat membaca database: {str(e)}"
 
 
+def collect_health_report(root_path: str) -> dict:
+    """Kumpul status kesehatan bank (read-only). Tidak menulis DB/md."""
+    norm = normalize_path(root_path)
+    db_path = get_db_path(norm)
+    report = {
+        "status": "missing",
+        "root_path": norm,
+        "db_exists": os.path.isfile(db_path),
+        "db_path": db_path,
+        "project_registered": False,
+        "project_name": None,
+        "core_in_db": [],
+        "core_missing_db": list(CORE_TYPES),
+        "core_md_present": [],
+        "core_md_missing": [],
+        "tasks_count": 0,
+        "tasks_md_exists": os.path.isfile(tasks_md_path(norm)),
+        "issues": [],
+    }
+
+    for ft in CORE_TYPES:
+        if os.path.isfile(core_md_path(norm, ft)):
+            report["core_md_present"].append(ft)
+        else:
+            report["core_md_missing"].append(ft)
+
+    if not report["db_exists"]:
+        if not report["core_md_present"]:
+            report["issues"].append("DB dan mirror .vmac tidak ada")
+        else:
+            report["status"] = "degraded"
+            report["issues"].append(
+                "Mirror .vmac ada tapi DB belum ada (jalankan read_entire_bank untuk auto-heal atau initialize)"
+            )
+        return report
+
+    try:
+        with get_db_connection(norm) as conn:
+            project_id = _get_project_id(conn, norm)
+            if not project_id:
+                report["issues"].append("DB ada tapi project belum terdaftar")
+                if report["core_md_present"]:
+                    report["status"] = "degraded"
+                return report
+
+            row = conn.execute(
+                "SELECT project_name FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            report["project_registered"] = True
+            report["project_name"] = row["project_name"] if row else None
+
+            rows = conn.execute(
+                "SELECT file_type FROM memory_core WHERE project_id = ?",
+                (project_id,),
+            ).fetchall()
+            present = [r["file_type"] for r in rows]
+            report["core_in_db"] = present
+            report["core_missing_db"] = [ft for ft in CORE_TYPES if ft not in present]
+
+            tc = conn.execute(
+                "SELECT COUNT(*) AS c FROM tasks WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()["c"]
+            report["tasks_count"] = int(tc)
+    except Exception as e:
+        report["issues"].append(f"Gagal baca DB: {e}")
+        report["status"] = "degraded"
+        return report
+
+    if report["core_missing_db"]:
+        report["issues"].append(
+            "Core hilang di DB: " + ", ".join(report["core_missing_db"])
+        )
+    if report["core_md_missing"]:
+        report["issues"].append(
+            "Core md hilang: " + ", ".join(report["core_md_missing"])
+        )
+    if report["tasks_count"] > 0 and not report["tasks_md_exists"]:
+        report["issues"].append("Ada tasks di DB tapi tasks.md tidak ada")
+
+    if report["issues"]:
+        report["status"] = "degraded"
+    else:
+        report["status"] = "ok"
+    return report
+
+
+@mcp.tool()
+def memory_bank_health(root_path: str) -> str:
+    """
+    Cek kesehatan Memory Bank di root_path: DB, project, kelengkapan 5 core, mirror .vmac, jumlah tasks.
+    Read-only; tidak mengubah data.
+    """
+    rep = collect_health_report(root_path)
+    lines = [
+        f"[Memory Bank Health: {rep['status'].upper()}]",
+        f"**Root:** {rep['root_path']}",
+        f"**DB:** {'ada' if rep['db_exists'] else 'tidak ada'} (`{rep['db_path']}`)",
+        f"**Project:** {rep['project_name'] or '-'} (registered={rep['project_registered']})",
+        f"**Core DB:** {', '.join(rep['core_in_db']) or '-'}",
+        f"**Core DB missing:** {', '.join(rep['core_missing_db']) or '-'}",
+        f"**Core md:** {', '.join(rep['core_md_present']) or '-'}",
+        f"**Core md missing:** {', '.join(rep['core_md_missing']) or '-'}",
+        f"**Tasks:** {rep['tasks_count']} | tasks.md={'ada' if rep['tasks_md_exists'] else 'tidak'}",
+    ]
+    if rep["issues"]:
+        lines.append("**Issues:**")
+        for i in rep["issues"]:
+            lines.append(f"- {i}")
+    else:
+        lines.append("**Issues:** tidak ada")
+    return "\n".join(lines)
+
+
 @mcp.tool()
 def export_memory_to_md(root_path: str, output_dir: Optional[str] = "") -> str:
     """
@@ -579,23 +752,38 @@ def export_memory_to_md(root_path: str, output_dir: Optional[str] = "") -> str:
 
 
 @mcp.tool()
-def update_memory_block(root_path: str, file_type: str, new_content: str) -> str:
+def update_memory_block(
+    root_path: str,
+    file_type: str,
+    new_content: str,
+    mode: Optional[str] = "replace",
+    section: Optional[str] = "",
+) -> str:
     """
-    Memperbarui satu blok file core tertentu (brief, product, context, architecture, tech) di SQLite.
-    Gunakan ini secara otomatis di akhir task (terutama untuk 'context') atau saat ada perubahan pola.
+    Memperbarui satu blok file core (product, context, architecture, tech).
+    mode=replace: new_content mengganti seluruh file.
+    mode=patch: ganti body di bawah heading '## {section}' (append section jika belum ada).
+    brief diblokir.
     """
     norm_path = normalize_path(root_path)
+    mode_norm = (mode or "replace").strip().lower()
 
     if file_type not in CORE_FILE_TYPES:
         return f"Error: Tipe file '{file_type}' tidak valid. Harus salah satu dari core files."
 
-    if file_type == 'brief':
+    if file_type == "brief":
         return (
             "Peringatan Keamanan: Berkas 'brief.md' adalah dokumen fondasi scope proyek yang HANYA boleh diubah secara manual "
             "oleh developer. Pembaruan otomatis melalui tool ini diblokir untuk menjaga integritas scope proyek."
         )
 
-    logger.info(f"Mengupdate block '{file_type}' untuk proyek di {norm_path}")
+    if mode_norm not in ("replace", "patch"):
+        return "Error: mode harus 'replace' atau 'patch'."
+
+    if mode_norm == "patch" and not (section or "").strip():
+        return "Error: mode=patch membutuhkan argumen 'section' (judul ## level-2)."
+
+    logger.info(f"Mengupdate block '{file_type}' mode={mode_norm} untuk proyek di {norm_path}")
 
     try:
         with get_db_connection(norm_path) as conn:
@@ -603,11 +791,20 @@ def update_memory_block(root_path: str, file_type: str, new_content: str) -> str
             if not project_id:
                 return f"Error: Proyek di path '{norm_path}' belum diinisialisasi. Jalankan inisialisasi terlebih dahulu."
 
-            upsert_memory_core(conn, project_id, file_type, new_content)
-            conn.commit()
-            write_core_md(norm_path, file_type, new_content)
+            final_content = new_content
+            if mode_norm == "patch":
+                row = conn.execute(
+                    "SELECT content FROM memory_core WHERE project_id = ? AND file_type = ?",
+                    (project_id, file_type),
+                ).fetchone()
+                current = row["content"] if row else ""
+                final_content = apply_section_patch(current, section.strip(), new_content)
 
-        return f"Sukses: Blok memori '{file_type}.md' berhasil diperbarui di SQLite dan `.vmac`."
+            upsert_memory_core(conn, project_id, file_type, final_content)
+            conn.commit()
+            write_core_md(norm_path, file_type, final_content)
+
+        return f"Sukses: Blok memori '{file_type}.md' berhasil diperbarui di SQLite dan `.vmac` (mode={mode_norm})."
     except Exception as e:
         logger.error(f"Gagal mengupdate blok memori: {str(e)}")
         return f"Error saat memperbarui database: {str(e)}"

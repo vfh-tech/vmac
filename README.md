@@ -21,6 +21,32 @@ Sistem ini membantu AI mempertahankan memori jangka panjang, konteks pengerjaan 
 
 ---
 
+## Edit manual `.vmac` → SQLite
+
+Lokasi mirror: `[root_path]/.vmac/rules/memory-bank/`
+
+| File | Arah sync | Edit manual? |
+|---|---|---|
+| `brief.md`, `product.md`, `context.md`, `architecture.md`, `tech.md` | Dua arah (mtime file menang) | Ya → masuk DB saat `read_entire_bank` |
+| `tasks.md` | Satu arah DB→file | Tidak. Pakai tool task (`add_repetitive_task` / `update_task`) |
+
+### Aturan mtime
+- Pemicu: **hanya** saat `read_entire_bank` (bukan file watcher real-time).
+- Import jika: file ada **dan** `mtime_file > updated_at_DB + 1s` **dan** isi berbeda → upsert ke `memory_core`.
+- Export jika: file hilang, baris DB ada → tulis ulang `.md` dari DB.
+- Auto-heal: project hilang di DB tapi folder `.vmac` ada → import core dari file.
+
+### Langkah edit core
+1. Ubah salah satu core `.md` di atas (contoh `context.md`).
+2. Panggil `read_entire_bank(root_path)`.
+3. Isi file yang lebih baru diimpor ke SQLite; output tool memuat teks hasil edit.
+
+### Yang tidak di-sync balik
+- Edit manual `tasks.md` **tidak** masuk tabel `tasks`.
+- Tidak ada debounce/polling background; tanpa `read_entire_bank`, DB tetap isi lama.
+
+---
+
 ## 🛠️ Persyaratan Sistem
 
 - **Python:** versi `>= 3.10`
@@ -88,40 +114,68 @@ Jika Anda ingin menggunakannya di aplikasi **Claude Desktop App**, tambahkan kon
 
 ## 📋 Daftar Tool MCP yang Tersedia
 
-### 1. `initialize_memory_bank`
-Inisialisasi sistem Memory Bank di proyek baru. Menjalankan pemindaian proyek dan membuat database SQLite di root proyek.
-- **Argumen:**
-  - `project_name` (string, required): Nama proyek Anda.
-  - `root_path` (string, required): Jalur absolut direktori root proyek.
-  - `initial_analysis` (string, optional): Catatan analisis tambahan dari arsitektur.
+### Core memory
 
-### 2. `read_entire_bank`
-Membaca seluruh isi Memory Bank dari SQLite untuk memulihkan konteks memori AI di awal tugas.
+#### 1. `initialize_memory_bank`
+Inisialisasi / re-init Memory Bank di root proyek. First-run: buat DB + 5 core + mirror `.vmac`. Re-init: **tidak menimpa** core yang sudah diisi user; hanya pastikan skema/DB/mirror ada dan update `project_name`.
 - **Argumen:**
-  - `root_path` (string, required): Jalur absolut direktori root proyek.
+  - `project_name` (string, required)
+  - `root_path` (string, required)
+  - `initial_analysis` (string, optional) — hanya diterapkan ke `architecture` pada **first-run**
 
-### 3. `update_memory_block`
-Memperbarui satu blok memory core tertentu di database SQLite.
-- **Argumen:**
-  - `root_path` (string, required): Jalur absolut direktori root proyek.
-  - `file_type` (string, required): Salah satu dari `product`, `context`, `architecture`, `tech` (*Tipe `brief` diblokir otomatis*).
-  - `new_content` (string, required): Konten Markdown baru.
+#### 2. `read_entire_bank`
+Baca seluruh core dari SQLite + **sync mtime `.vmac` (file menang)**. Setelah edit manual core `.md`, panggil tool ini agar isi masuk SQLite. Auto-heal jika DB kosong / project hilang tapi `.vmac` ada.
+- **Argumen:** `root_path` (required)
+- **Efek samping sync:** `import:<file_type>` jika mtime file menang; `export:<file_type>` jika mirror hilang
 
-### 4. `add_repetitive_task`
-Menyimpan Standar Operasional Prosedur (SOP) untuk pekerjaan berulang ke tabel `tasks` di database SQLite.
+#### 3. `update_memory_block`
+Update satu blok core (`product` | `context` | `architecture` | `tech`). `brief` diblokir.
 - **Argumen:**
-  - `root_path` (string, required): Jalur absolut direktori root proyek.
-  - `task_name` (string, required): Nama tugas (misal: "Tambah Model AI Baru").
-  - `description` (string, required): Kegunaan prosedur.
-  - `steps` (string, required): Langkah-langkah detail.
-  - `files_to_modify` (string, optional): Daftar berkas yang perlu diubah.
-  - `gotchas` (string, optional): Catatan kritis yang harus diperhatikan.
+  - `root_path` (required)
+  - `file_type` (required)
+  - `new_content` (required) — full replace (default) atau body section jika `mode=patch`
+  - `mode` (optional, default `replace`): `replace` | `patch`
+  - `section` (optional): heading Markdown level-2 (`## Nama`) yang diganti saat `mode=patch`
 
-### 5. `read_task`
-Membaca detail lengkap satu SOP dari tabel `tasks`, termasuk steps, files_to_modify, dan gotchas.
-- **Argumen:**
-  - `root_path` (string, required): Jalur absolut direktori root proyek.
-  - `task_name` (string, required): Nama task yang ingin dibaca detailnya.
+#### 4. `export_memory_to_md`
+Export seluruh memory ke folder Markdown.
+- **Argumen:** `root_path` (required), `output_dir` (optional, default `.vmac/export/`)
+
+#### 5. `search_memory`
+Cari keyword di `memory_core` + `tasks`.
+- **Argumen:** `root_path` (required), `keyword` (required)
+
+### Tasks (SOP)
+
+#### 6. `add_repetitive_task`
+Simpan SOP baru.
+- **Argumen:** `root_path`, `task_name`, `description`, `steps` (required); `files_to_modify`, `gotchas` (optional)
+
+#### 7. `update_task`
+Update / rename SOP.
+- **Argumen:** `root_path`, `task_name`, `description`, `steps` (required); `files_to_modify`, `gotchas`, `new_task_name` (optional)
+
+#### 8. `delete_repetitive_task`
+Hapus SOP.
+- **Argumen:** `root_path`, `task_name`
+
+#### 9. `read_task`
+Detail satu SOP.
+- **Argumen:** `root_path`, `task_name`
+
+#### 10. `log_task_execution`
+Catat eksekusi SOP + update `last_performed`.
+- **Argumen:** `root_path`, `task_name`; `result_summary` (optional)
+
+#### 11. `list_task_history`
+Riwayat log (max 50).
+- **Argumen:** `root_path`; `task_name` (optional)
+
+### Ops
+
+#### 12. `memory_bank_health`
+Cek kesehatan bank (read-only): status `ok` | `degraded` | `missing`, kelengkapan core DB/md, jumlah tasks.
+- **Argumen:** `root_path` (required)
 
 ---
 
@@ -142,6 +196,7 @@ graph TD
     I --> H
 ```
 
-1. **Awal Tugas:** AI wajib menjalankan `read_entire_bank` untuk menyerap status pengerjaan terakhir secara akurat.
-2. **Saat Menghadapi Fitur Berulang:** AI mendeteksi apakah SOP tugas tersebut sudah terdaftar di tabel tasks SQLite dan mengikutinya agar terhindar dari kesalahan yang pernah terjadi sebelumnya.
-3. **Akhir Tugas:** AI memperbarui blok context di SQLite menggunakan `update_memory_block` untuk mendokumentasikan langkah yang telah selesai dan rencana tugas berikutnya lintas sesi.
+1. **Awal Tugas:** AI wajib menjalankan `read_entire_bank` untuk menyerap status terakhir **dan** mengimpor edit manual core `.md` (mtime file menang).
+2. **Saat Menghadapi Fitur Berulang:** AI mendeteksi apakah SOP sudah ada di tabel `tasks` (bukan dari edit `tasks.md`) lalu mengikutinya.
+3. **Akhir Tugas:** AI memperbarui `context` via `update_memory_block` (write-through ke `.md`). Alternatif: edit manual core `.md` lalu `read_entire_bank` di sesi berikutnya.
+4. **Edit manual core:** boleh; selalu diikuti `read_entire_bank`. **Edit manual `tasks.md`:** diabaikan untuk DB — gunakan tool task.
